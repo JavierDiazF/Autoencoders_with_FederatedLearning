@@ -1,0 +1,14 @@
+# Reproducible runtime environment for Autoencoders/iiot_compression_experiment.py.
+# Do NOT combine with Datadriven/bentoml_service/requirements.txt -- their
+# pandas/scipy pins conflict (pandas==2.0.3 there vs pandas>=2.1 here).
+# Install with:
+#   python -m pip install -r Autoencoders/requirements.txt
+numpy>=1.26,<3
+pandas>=2.1,<4
+torch>=2.2,<3
+matplotlib>=3.8,<4
+scipy>=1.11,<2
+torchprofile
+bentoml>=1.0.0
+scikit-learn>=1.3,<2
+joblib>=1.3,<2
