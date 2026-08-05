@@ -8,7 +8,7 @@ import bentoml
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
@@ -30,7 +30,7 @@ INPUT_DIMS_RATIO_SWEEP = [50, 60, 70, 80, 90, 100]
 COMPRESSION_RATIOS = [2, 5, 10, 15, 20]
 
 # Test "latent": fixed window size, vary the latent dimension directly.
-INPUT_DIM_LATENT_SWEEP = 50
+INPUT_DIM_LATENT_SWEEP = 100
 LATENT_DIMS_LATENT_SWEEP = [2, 4, 8, 16, 32]
 
 N_ITERATIONS = 30                  # seeds 0..N_ITERATIONS-1, shared across both scenarios
@@ -52,9 +52,24 @@ BENTO_TAG_PREFIX = "iiot_sweep"
 
 # Overheating label: one-sided z-score of a window's own last reading against
 # the mean/std of its own preceding window_size-1 readings (Shewhart-style
-# control-chart rule, k_sigma=2
-K_SIGMA = 2
+# control-chart rule). K_SIGMA_SWEEP is processed in order by main(), one
+# full results subdirectory per value (see run_ratio_sweep/run_latent_sweep
+# output_dir). K_SIGMA itself is mutated per iteration -- read as a plain
+# global inside build_windows(), same pattern as apply_smoke_test_overrides.
+K_SIGMA_SWEEP = [2, 1.5]
+K_SIGMA = K_SIGMA_SWEEP[0]
 Z_SCORE_EPSILON = 1e-6             # guards baseline_std == 0 (a perfectly flat preceding window)
+
+# ------------------------------ Classifier / detector parameters ---------------------------------
+# Selected via --classifier {rf,if} in main() (mutates CLASSIFIER_TYPE).
+#   "rf": supervised RandomForestClassifier, trained on ALL train windows
+#         (normal + anomalous) with their z-score labels.
+#   "if": unsupervised IsolationForest, fit only on the NORMAL (label=0)
+#         train windows -- labels are only used to size `contamination`,
+#         never as a training target.
+CLASSIFIER_TYPE = "rf"
+RF_CLASS_WEIGHT = "balanced"       # compensates the imbalanced dataset
+IF_CONTAMINATION_BOUNDS = (1e-3, 0.5)  # sklearn requires contamination in (0, 0.5]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -178,6 +193,26 @@ def build_pooled_windows(pools: Dict[str, Dict[str, np.ndarray]], split: str, wi
     return np.concatenate(all_windows), np.concatenate(all_labels), counts
 
 
+def build_val_split(pools: Dict[str, Dict[str, np.ndarray]], window_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+    """Builds the val windows (non-overlapping, like test), split into:
+      - X_val_normal: label=0 windows, the only ones the AE ever trains on
+        (its early stopping is unsupervised anyway, so val's labels were
+        never used for anything else).
+      - X_val_anomalous / y_val_anomalous: the label=1 windows, recycled
+        into the test set by the caller -- test is where positives are
+        scarcest, so these would otherwise go completely unused.
+    Returns (X_val_normal, X_val_anomalous, y_val_anomalous, counts), counts
+    being the total (normal+anomalous) window count per location."""
+    normal_parts, anomalous_parts, anomalous_labels, counts = [], [], [], {}
+    for location in LOCATIONS:
+        windows, labels = build_windows(pools[location]["val"], window_size, [window_size])
+        normal_parts.append(windows[labels == 0])
+        anomalous_parts.append(windows[labels == 1])
+        anomalous_labels.append(labels[labels == 1])
+        counts[location.lower()] = len(windows)
+    return (np.concatenate(normal_parts), np.concatenate(anomalous_parts), np.concatenate(anomalous_labels), counts)
+
+
 # ------------------------------ AE training & encoding ---------------------------------
 
 def train_ae_config(X_train: np.ndarray, X_val: np.ndarray, input_dim: int, latent_dim: int, n_layers: int, asymmetric: bool, epochs: int, patience: int, seed: int) -> AsymmetricAutoencoder:
@@ -243,14 +278,29 @@ def feature_columns(width: int) -> List[str]:
     return [f"v{i}" for i in range(width)]
 
 
-def train_classifier(X: np.ndarray, y: np.ndarray, seed: int) -> RandomForestClassifier:
-    """Train random forest classifier."""
-    clf = RandomForestClassifier(random_state=seed)
-    clf.fit(pd.DataFrame(X, columns=feature_columns(X.shape[1])), y)
+def fit_detector(X: np.ndarray, y: np.ndarray, seed: int):
+    """Trains the classifier/detector selected by CLASSIFIER_TYPE (set from
+    --classifier in main()):
+      - "rf": supervised RandomForestClassifier(class_weight=RF_CLASS_WEIGHT),
+              trained on ALL of X/y (normal + anomalous).
+      - "if": unsupervised IsolationForest, fit only on the NORMAL (y==0)
+              rows of X -- y is only used to size `contamination`, never as
+              a training target. Contamination is used to specify the
+              proportion of outliers in the dataset"""
+    columns = feature_columns(X.shape[1])
+    if CLASSIFIER_TYPE == "if":
+        contamination = float(np.mean(y)) if len(y) else IF_CONTAMINATION_BOUNDS[0]
+        contamination = min(max(contamination, IF_CONTAMINATION_BOUNDS[0]), IF_CONTAMINATION_BOUNDS[1])
+        clf = IsolationForest(random_state=seed, contamination=contamination)
+        clf.fit(pd.DataFrame(X[y == 0], columns=columns))
+        return clf
+
+    clf = RandomForestClassifier(random_state=seed, class_weight=RF_CLASS_WEIGHT)
+    clf.fit(pd.DataFrame(X, columns=columns), y)
     return clf
 
 
-def bento_save_and_runner(model: RandomForestClassifier, tag: str):
+def bento_save_and_runner(model, tag: str):
     """Saves the trained model and run it for the inferetions"""
     bentoml.sklearn.save_model(tag, model)
     runner = bentoml.sklearn.get(f"{tag}:latest").to_runner()
@@ -259,9 +309,14 @@ def bento_save_and_runner(model: RandomForestClassifier, tag: str):
 
 
 def bento_predict(runner, X: np.ndarray) -> np.ndarray:
-    """Predicts with test data by using the previously trained and loaded runner"""
+    """Predicts with test data by using the previously trained and loaded runner.
+    IsolationForest's raw output is -1 (anomaly) / 1 (normal); normalized here
+    to the same 0/1 (normal/anomaly) convention used everywhere else."""
     df = pd.DataFrame(X, columns=feature_columns(X.shape[1]))
-    return np.asarray(runner.predict.run(df))
+    preds = np.asarray(runner.predict.run(df))
+    if CLASSIFIER_TYPE == "if":
+        return (preds == -1).astype(np.int64)
+    return preds
 
 
 def json_payload_bytes_mean(X: np.ndarray, decimals: int = JSON_FLOAT_DECIMALS) -> float:
@@ -274,13 +329,18 @@ def json_payload_bytes_mean(X: np.ndarray, decimals: int = JSON_FLOAT_DECIMALS) 
     return float(np.mean(sizes))
 
 
-def positive_class_proba(clf: RandomForestClassifier, X: np.ndarray) -> Optional[np.ndarray]:
-    """None if class 1 isn't present in clf.classes_ -- can happen on tiny
-    or heavily imbalanced folds (e.g. --smoke-test)."""
+def positive_class_score(clf, X: np.ndarray) -> Optional[np.ndarray]:
+    """Score used for ROC-AUC -- higher must mean 'more likely anomalous'.
+    For "if", IsolationForest.decision_function() is higher for NORMAL
+    points, so it's negated. For "rf", None if class 1 isn't present in
+    clf.classes_ -- can happen on tiny or heavily imbalanced folds (e.g.
+    --smoke-test)."""
+    df = pd.DataFrame(X, columns=feature_columns(X.shape[1]))
+    if CLASSIFIER_TYPE == "if":
+        return -clf.decision_function(df)
     classes = list(clf.classes_)
     if 1 not in classes:
         return None
-    df = pd.DataFrame(X, columns=feature_columns(X.shape[1]))
     return clf.predict_proba(df)[:, classes.index(1)]
 
 
@@ -312,28 +372,39 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
     target_ratio_by_latent = target_ratio_by_latent or {}
     rows: List[dict] = []
 
+    tag_prefix = f"{BENTO_TAG_PREFIX}_{CLASSIFIER_TYPE}_k{str(K_SIGMA).replace('.', '_')}"
+
     for seed in range(N_ITERATIONS):
         np.random.seed(seed)
         X_tr, y_tr, tr_cnt = build_pooled_windows(pools, "train", input_dim, TRAIN_STRIDE)
-        X_va, _, _ = build_pooled_windows(pools, "val", input_dim, [input_dim])
+        X_va_normal, X_va_recycled, y_va_recycled, _ = build_val_split(pools, input_dim)
         X_te, y_te, te_cnt = build_pooled_windows(pools, "test", input_dim, [input_dim])
+
+        # Val's labels were never used for anything else (its only role is
+        # unsupervised AE early stopping), so its anomalous windows are
+        # recycled into test, which is where positives are scarcest.
+        X_te = np.concatenate([X_te, X_va_recycled])
+        y_te = np.concatenate([y_te, y_va_recycled])
         test_pos_rate = float(y_te.mean()) if len(y_te) else float("nan")
 
         base_row = {
+            "classifier": CLASSIFIER_TYPE, "k_sigma": K_SIGMA,
             "input_dim": input_dim, "seed": seed,
             "n_train": len(X_tr), "n_train_in": tr_cnt["in"], "n_train_out": tr_cnt["out"],
-            "n_val": len(X_va),
+            "n_val": len(X_va_normal),
             "n_test": len(X_te), "n_test_in": te_cnt["in"], "n_test_out": te_cnt["out"],
+            "n_test_recycled_from_val": len(X_va_recycled),
             "test_pos_rate": test_pos_rate,
         }
 
         # ---- raw scenario: once per (input_dim, seed) -- independent of latent_dim ----
-        # Trains bentoml with raw splitted windows
+        # Trains bentoml with raw splitted windows (fit_detector filters to
+        # normal-only internally for "if"; "rf" always sees the full set)
         t0 = time.time()
-        raw_clf = train_classifier(X_tr, y_tr, seed)
-        raw_runner = bento_save_and_runner(raw_clf, f"{BENTO_TAG_PREFIX}_raw_{input_dim}_{seed}")
+        raw_clf = fit_detector(X_tr, y_tr, seed)
+        raw_runner = bento_save_and_runner(raw_clf, f"{tag_prefix}_raw_{input_dim}_{seed}")
         raw_preds = bento_predict(raw_runner, X_te)
-        raw_metrics = classification_metrics(y_te, raw_preds, positive_class_proba(raw_clf, X_te))
+        raw_metrics = classification_metrics(y_te, raw_preds, positive_class_score(raw_clf, X_te))
         rows.append({
             **base_row, "scenario": "raw",
             "latent_dim": None, "symmetric": None, "hidden_layers": None,
@@ -345,9 +416,16 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
         })
         print(f"[input_dim={input_dim} seed={seed}] raw: acc={raw_metrics['accuracy']:.3f} "
               f"f1={raw_metrics['f1']:.3f} ({time.time() - t0:.1f}s)")
-        # min max scale for the autoencoder
+
+        # min max scale for the autoencoder. X_tr_s (full) feeds encode() to
+        # get Z_tr for the downstream detector;
+        # Select only normal subset for training in order to maximize detection of anomalies in AE
+        # (X_tr_normal_s) actually trains the AE's weights, so it learns to
+        # compress "normal" behaviour well and genuine overheating windows
+        # fall in a worse-modelled, more separable region of latent space.
         X_tr_s = scale(X_tr, g_min, g_max)
-        X_va_s = scale(X_va, g_min, g_max)
+        X_tr_normal_s = X_tr_s[y_tr == 0]
+        X_va_normal_s = scale(X_va_normal, g_min, g_max)
         X_te_s = scale(X_te, g_min, g_max)
 
         for latent_dim in latent_dims:
@@ -355,19 +433,18 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
                 continue
             for asymmetric in ASYMMETRIC_OPTIONS:
                 t1 = time.time()
-                # Trains ae model
-                ae = train_ae_config(X_tr_s, X_va_s, input_dim, latent_dim, HIDDEN_LAYERS,
-                                      asymmetric, EPOCHS, PATIENCE, seed)
-                # We need to encode also train data in order to train the bentoml
+                # Trains ae model -- normal-only train/val
+                ae = train_ae_config(X_tr_normal_s, X_va_normal_s, input_dim, latent_dim, HIDDEN_LAYERS, asymmetric, EPOCHS, PATIENCE, seed)
+                # Encode ALL train windows (normal + anomalous) so the
+                # downstream detector can be fit/evaluated on labeled data
                 Z_tr, Z_te = encode(ae, X_tr_s), encode(ae, X_te_s)
-                # Train and save bentoml model
-                ae_clf = train_classifier(Z_tr, y_tr, seed)
+                ae_clf = fit_detector(Z_tr, y_tr, seed)
                 arch = "asym" if asymmetric else "sym"
                 ae_runner = bento_save_and_runner(
-                    ae_clf, f"{BENTO_TAG_PREFIX}_{arch}_{input_dim}_{latent_dim}_{seed}"
+                    ae_clf, f"{tag_prefix}_{arch}_{input_dim}_{latent_dim}_{seed}"
                 )
                 ae_preds = bento_predict(ae_runner, Z_te)
-                ae_metrics = classification_metrics(y_te, ae_preds, positive_class_proba(ae_clf, Z_te))
+                ae_metrics = classification_metrics(y_te, ae_preds, positive_class_score(ae_clf, Z_te))
                 agreement = float(np.mean(ae_preds == raw_preds))
                 rows.append({
                     **base_row, "scenario": "latent",
@@ -386,11 +463,12 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
     return rows
 
 
-def run_ratio_sweep(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_max: float) -> None:
+def run_ratio_sweep(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_max: float, output_dir: Path) -> None:
     """Test 1: window size in INPUT_DIMS_RATIO_SWEEP, at each target
     compression ratio in COMPRESSION_RATIOS (latent_dim derived per pair)."""
     print("=" * 70)
-    print(f"RATIO SWEEP -- input_dim in {INPUT_DIMS_RATIO_SWEEP}, ratio in {COMPRESSION_RATIOS}")
+    print(f"RATIO SWEEP -- classifier={CLASSIFIER_TYPE} K_SIGMA={K_SIGMA} "
+          f"input_dim in {INPUT_DIMS_RATIO_SWEEP}, ratio in {COMPRESSION_RATIOS}")
     print("=" * 70)
 
     rows: List[dict] = []
@@ -403,25 +481,28 @@ def run_ratio_sweep(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_max
         rows.extend(run_one_input_dim(pools, g_min, g_max, input_dim, list(target_ratio_by_latent), target_ratio_by_latent))
 
     out_name = "iiot_ratio_sweep_smoketest.csv" if SMOKE_TEST else "iiot_ratio_sweep.csv"
-    save_csv(rows, RESULTS_DIR / out_name)
+    save_csv(rows, output_dir / out_name)
 
 
-def run_latent_sweep(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_max: float) -> None:
+def run_latent_sweep(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_max: float, output_dir: Path) -> None:
     """Test 2: fixed window size (INPUT_DIM_LATENT_SWEEP), latent_dim swept
     directly over LATENT_DIMS_LATENT_SWEEP."""
     print("=" * 70)
-    print(f"LATENT SWEEP -- input_dim={INPUT_DIM_LATENT_SWEEP}, latent_dim in {LATENT_DIMS_LATENT_SWEEP}")
+    print(f"LATENT SWEEP -- classifier={CLASSIFIER_TYPE} K_SIGMA={K_SIGMA} "
+          f"input_dim={INPUT_DIM_LATENT_SWEEP}, latent_dim in {LATENT_DIMS_LATENT_SWEEP}")
     print("=" * 70)
 
     rows = run_one_input_dim(pools, g_min, g_max, INPUT_DIM_LATENT_SWEEP, LATENT_DIMS_LATENT_SWEEP)
 
     out_name = "iiot_latent_sweep_smoketest.csv" if SMOKE_TEST else "iiot_latent_sweep.csv"
-    save_csv(rows, RESULTS_DIR / out_name)
+    save_csv(rows, output_dir / out_name)
 
 
 def apply_smoke_test_overrides() -> None:
     """Shrinks both sweeps to a ~1-2 minute run each (6 rows apiece) to
-    sanity-check the pipeline end-to-end before committing to the real runs."""
+    sanity-check the pipeline end-to-end before committing to the real runs.
+    K_SIGMA_SWEEP and --classifier are left untouched so the smoke test still
+    exercises the multi-k / multi-classifier looping and directory logic."""
     global INPUT_DIMS_RATIO_SWEEP, COMPRESSION_RATIOS, INPUT_DIM_LATENT_SWEEP, LATENT_DIMS_LATENT_SWEEP
     global N_ITERATIONS, EPOCHS, PATIENCE, TRAIN_STRIDE
     INPUT_DIMS_RATIO_SWEEP = [20]
@@ -433,8 +514,12 @@ def apply_smoke_test_overrides() -> None:
     TRAIN_STRIDE = [7]
 
 
+def k_sigma_dir_suffix(k: float) -> str:
+    return str(k).replace(".", "_")
+
+
 def main() -> None:
-    global SMOKE_TEST
+    global SMOKE_TEST, CLASSIFIER_TYPE, K_SIGMA
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-test", action="store_true",
                          help="Tiny, fast run to sanity-check the pipeline end-to-end.")
@@ -442,20 +527,35 @@ def main() -> None:
                          help="'ratio' = Test 1 (input_dim x compression ratio), "
                               "'latent' = Test 2 (fixed input_dim x latent_dim), "
                               "'both' = run both (default).")
+    parser.add_argument("--classifier", choices=["rf", "if"], default="rf",
+                         help="'rf' = supervised RandomForestClassifier(class_weight=balanced). "
+                              "'if' = unsupervised IsolationForest, fit on normal-only windows "
+                              "(default: rf).")
     args = parser.parse_args()
     SMOKE_TEST = args.smoke_test
+    CLASSIFIER_TYPE = args.classifier
     if SMOKE_TEST:
         apply_smoke_test_overrides()
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     pools = {loc: chronological_pools(df) for loc, df in load_and_prepare(IIOT_CSV_PATH).items()}
     g_min, g_max = global_minmax(pools)
     print(f"Global temperature range used for AE scaling: [{g_min}, {g_max}]")
 
-    if args.sweep in ("ratio", "both"):
-        run_ratio_sweep(pools, g_min, g_max)
-    if args.sweep in ("latent", "both"):
-        run_latent_sweep(pools, g_min, g_max)
+    # K_SIGMA_SWEEP is processed in order, each value fully (both requested
+    # sweeps) before moving to the next, into its own results subdirectory --
+    # pools/g_min/g_max don't depend on K_SIGMA so they're built only once.
+    for k in K_SIGMA_SWEEP:
+        K_SIGMA = k
+        output_dir = RESULTS_DIR / f"results_{CLASSIFIER_TYPE}_k_{k_sigma_dir_suffix(k)}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print("#" * 70)
+        print(f"# classifier={CLASSIFIER_TYPE}  K_SIGMA={k}  ->  {output_dir}")
+        print("#" * 70)
+
+        if args.sweep in ("ratio", "both"):
+            run_ratio_sweep(pools, g_min, g_max, output_dir)
+        if args.sweep in ("latent", "both"):
+            run_latent_sweep(pools, g_min, g_max, output_dir)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+%% Script to plot Autoencdoers results 
+%
+%   [+] Original Author:    Javier Dáiz <j.diazf@edu.uah.es> 
+%
+%   [+] Date: 30 March 2026
+
+clc
+close all
+clear variables
+
+%% Global vars
+RESULTS_DIR = 'results';
+MATLAB_RESULTS_DIR = 'matlab_results';
+SWEEP_A_RESULTS = 'sweep_a_results';
+SWEEP_B_RESULTS = 'sweep_b_results';
+ENERGY_PJ_PER_MAC = 4.6;   % Horowitz, ISSCC 2014, 45nm float32 mult+add (pJ/MAC)
+
+COLOR_SYM  = [0.00, 0.45, 0.74];   % azul   -> simetrico
+COLOR_ASYM = [0.85, 0.33, 0.10];   % naranja -> asimetrico
+
+%% Load and save data
+if (isfile(fullfile(MATLAB_RESULTS_DIR, SWEEP_A_RESULTS)) && isfile(fullfile(MATLAB_RESULTS_DIR, SWEEP_B_RESULTS)))
+    % File exist.
+    disp("Getting data from stored variables")
+else
+    sweepA = readtable(fullfile('..', RESULTS_DIR, 'sweep_a_results.csv'));
+    sweepB = readtable(fullfile('..', RESULTS_DIR, 'sweep_b_results.csv'));
+end
