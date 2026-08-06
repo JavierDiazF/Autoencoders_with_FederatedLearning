@@ -308,6 +308,15 @@ def bento_save_and_runner(model, tag: str):
     return runner
 
 
+def bento_cleanup(tag: str) -> None:
+    """Deletes `tag` from BentoML's local model store right after its one
+    to ensure it does not crash due to lack of space"""
+    try:
+        bentoml.models.delete(tag)
+    except Exception as exc:  # keep the sweep going even if cleanup itself fails
+        print(f"  (warning: could not delete bentoml model '{tag}': {exc})")
+
+
 def bento_predict(runner, X: np.ndarray) -> np.ndarray:
     """Predicts with test data by using the previously trained and loaded runner.
     IsolationForest's raw output is -1 (anomaly) / 1 (normal); normalized here
@@ -402,8 +411,10 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
         # normal-only internally for "if"; "rf" always sees the full set)
         t0 = time.time()
         raw_clf = fit_detector(X_tr, y_tr, seed)
-        raw_runner = bento_save_and_runner(raw_clf, f"{tag_prefix}_raw_{input_dim}_{seed}")
+        raw_tag = f"{tag_prefix}_raw_{input_dim}_{seed}"
+        raw_runner = bento_save_and_runner(raw_clf, raw_tag)
         raw_preds = bento_predict(raw_runner, X_te)
+        bento_cleanup(raw_tag)
         raw_metrics = classification_metrics(y_te, raw_preds, positive_class_score(raw_clf, X_te))
         rows.append({
             **base_row, "scenario": "raw",
@@ -440,10 +451,10 @@ def run_one_input_dim(pools: Dict[str, Dict[str, np.ndarray]], g_min: float, g_m
                 Z_tr, Z_te = encode(ae, X_tr_s), encode(ae, X_te_s)
                 ae_clf = fit_detector(Z_tr, y_tr, seed)
                 arch = "asym" if asymmetric else "sym"
-                ae_runner = bento_save_and_runner(
-                    ae_clf, f"{tag_prefix}_{arch}_{input_dim}_{latent_dim}_{seed}"
-                )
+                ae_tag = f"{tag_prefix}_{arch}_{input_dim}_{latent_dim}_{seed}"
+                ae_runner = bento_save_and_runner(ae_clf, ae_tag)
                 ae_preds = bento_predict(ae_runner, Z_te)
+                bento_cleanup(ae_tag)
                 ae_metrics = classification_metrics(y_te, ae_preds, positive_class_score(ae_clf, Z_te))
                 agreement = float(np.mean(ae_preds == raw_preds))
                 rows.append({
