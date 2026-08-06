@@ -8,6 +8,7 @@ import bentoml
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from torch.optim import Adam
@@ -61,15 +62,25 @@ K_SIGMA = K_SIGMA_SWEEP[0]
 Z_SCORE_EPSILON = 1e-6             # guards baseline_std == 0 (a perfectly flat preceding window)
 
 # ------------------------------ Classifier / detector parameters ---------------------------------
-# Selected via --classifier {rf,if} in main() (mutates CLASSIFIER_TYPE).
+# Selected via --classifier {rf,if,ee} in main() (mutates CLASSIFIER_TYPE).
 #   "rf": supervised RandomForestClassifier, trained on ALL train windows
 #         (normal + anomalous) with their z-score labels.
 #   "if": unsupervised IsolationForest, fit only on the NORMAL (label=0)
 #         train windows -- labels are only used to size `contamination`,
-#         never as a training target.
+#         never as a training target. Isolates points via random axis-aligned
+#         splits -- doesn't account for correlation between dimensions, which
+#         degrades on the "raw" scenario's 50-100 highly autocorrelated
+#         consecutive-reading dimensions (see conversation).
+#   "ee": unsupervised EllipticEnvelope (robust covariance / Mahalanobis
+#         distance), also fit on NORMAL-only windows. Unlike "if", the
+#         covariance matrix explicitly captures correlation between
+#         dimensions, which should suit the "raw" scenario's redundant
+#         dimensions better -- and it assumes local Gaussianity, the same
+#         assumption K_SIGMA's z-score label itself already makes.
 CLASSIFIER_TYPE = "rf"
+UNSUPERVISED_CLASSIFIERS = {"if", "ee"}  # share the fit-on-normal-only / -1,1 predict() convention
 RF_CLASS_WEIGHT = "balanced"       # compensates the imbalanced dataset
-IF_CONTAMINATION_BOUNDS = (1e-3, 0.5)  # sklearn requires contamination in (0, 0.5]
+IF_CONTAMINATION_BOUNDS = (1e-3, 0.5)  # sklearn requires contamination in (0, 0.5]; shared by "if"/"ee"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -283,15 +294,18 @@ def fit_detector(X: np.ndarray, y: np.ndarray, seed: int):
     --classifier in main()):
       - "rf": supervised RandomForestClassifier(class_weight=RF_CLASS_WEIGHT),
               trained on ALL of X/y (normal + anomalous).
-      - "if": unsupervised IsolationForest, fit only on the NORMAL (y==0)
-              rows of X -- y is only used to size `contamination`, never as
-              a training target. Contamination is used to specify the
-              proportion of outliers in the dataset"""
+      - "if"/"ee": unsupervised IsolationForest / EllipticEnvelope, fit only
+              on the NORMAL (y==0) rows of X -- y is only used to size
+              `contamination` (the proportion of outliers assumed), never as
+              a training target."""
     columns = feature_columns(X.shape[1])
-    if CLASSIFIER_TYPE == "if":
+    if CLASSIFIER_TYPE in UNSUPERVISED_CLASSIFIERS:
         contamination = float(np.mean(y)) if len(y) else IF_CONTAMINATION_BOUNDS[0]
         contamination = min(max(contamination, IF_CONTAMINATION_BOUNDS[0]), IF_CONTAMINATION_BOUNDS[1])
-        clf = IsolationForest(random_state=seed, contamination=contamination)
+        if CLASSIFIER_TYPE == "if":
+            clf = IsolationForest(random_state=seed, contamination=contamination)
+        else:
+            clf = EllipticEnvelope(random_state=seed, contamination=contamination)
         clf.fit(pd.DataFrame(X[y == 0], columns=columns))
         return clf
 
@@ -319,11 +333,12 @@ def bento_cleanup(tag: str) -> None:
 
 def bento_predict(runner, X: np.ndarray) -> np.ndarray:
     """Predicts with test data by using the previously trained and loaded runner.
-    IsolationForest's raw output is -1 (anomaly) / 1 (normal); normalized here
-    to the same 0/1 (normal/anomaly) convention used everywhere else."""
+    IsolationForest/EllipticEnvelope's raw output is -1 (anomaly) / 1 (normal),
+    the shared sklearn outlier-detector convention; normalized here to the
+    same 0/1 (normal/anomaly) convention used everywhere else."""
     df = pd.DataFrame(X, columns=feature_columns(X.shape[1]))
     preds = np.asarray(runner.predict.run(df))
-    if CLASSIFIER_TYPE == "if":
+    if CLASSIFIER_TYPE in UNSUPERVISED_CLASSIFIERS:
         return (preds == -1).astype(np.int64)
     return preds
 
@@ -340,12 +355,12 @@ def json_payload_bytes_mean(X: np.ndarray, decimals: int = JSON_FLOAT_DECIMALS) 
 
 def positive_class_score(clf, X: np.ndarray) -> Optional[np.ndarray]:
     """Score used for ROC-AUC -- higher must mean 'more likely anomalous'.
-    For "if", IsolationForest.decision_function() is higher for NORMAL
-    points, so it's negated. For "rf", None if class 1 isn't present in
-    clf.classes_ -- can happen on tiny or heavily imbalanced folds (e.g.
-    --smoke-test)."""
+    For "if"/"ee", decision_function() is higher for NORMAL points (shared
+    sklearn outlier-detector convention), so it's negated. For "rf", None if
+    class 1 isn't present in clf.classes_ -- can happen on tiny or heavily
+    imbalanced folds (e.g. --smoke-test)."""
     df = pd.DataFrame(X, columns=feature_columns(X.shape[1]))
-    if CLASSIFIER_TYPE == "if":
+    if CLASSIFIER_TYPE in UNSUPERVISED_CLASSIFIERS:
         return -clf.decision_function(df)
     classes = list(clf.classes_)
     if 1 not in classes:
@@ -538,10 +553,11 @@ def main() -> None:
                          help="'ratio' = Test 1 (input_dim x compression ratio), "
                               "'latent' = Test 2 (fixed input_dim x latent_dim), "
                               "'both' = run both (default).")
-    parser.add_argument("--classifier", choices=["rf", "if"], default="rf",
+    parser.add_argument("--classifier", choices=["rf", "if", "ee"], default="rf",
                          help="'rf' = supervised RandomForestClassifier(class_weight=balanced). "
-                              "'if' = unsupervised IsolationForest, fit on normal-only windows "
-                              "(default: rf).")
+                              "'if' = unsupervised IsolationForest, fit on normal-only windows. "
+                              "'ee' = unsupervised EllipticEnvelope (robust covariance / Mahalanobis "
+                              "distance), also fit on normal-only windows (default: rf).")
     args = parser.parse_args()
     SMOKE_TEST = args.smoke_test
     CLASSIFIER_TYPE = args.classifier
